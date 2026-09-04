@@ -1,0 +1,404 @@
+# Guía de despliegue — BarrioFix Backend (AMI dorada + código en S3)
+
+> **Contexto para el asistente que lea esto:** esto es un lab de AWS Academy Learner Lab.
+> El objetivo es desplegar una API FastAPI en un ASG detrás de un ALB, con las instancias en
+> subredes **privadas sin acceso a internet** (no hay NAT Gateway). El código de la app se baja
+> de S3 en el arranque a través de un **Gateway VPC Endpoint** de S3.
+> Las dependencias de Python **no se instalan en el arranque** (no hay internet para PyPI):
+> vienen pre-instaladas dentro de una AMI dorada que se construye una sola vez.
+> No se pueden crear roles IAM: hay que usar `LabRole` / `LabInstanceProfile`.
+> Guiame paso a paso por la consola de AWS, una fase a la vez, y esperá mi confirmación
+> antes de pasar a la siguiente.
+
+---
+
+## Fase 0 — Tabla de nombres (completar ANTES de empezar)
+
+Lo que el **código** realmente necesita (solo esto, todo lo demás es infra):
+
+| Variable de entorno | Valor por defecto en el código | Tu valor |
+|---|---|---|
+| `AWS_REGION` | `us-east-1` | `us-east-1` ✅ |
+| `MEDIA_BUCKET` | `barriofix-media-clara` | `barriofix-media-clara` ✅ |
+| `CORS_ORIGINS` | `*` | website endpoint del frontend ✅ |
+
+Los tres están documentados con instrucciones de reemplazo en
+[`.env.example`](../.env.example).
+
+Contratos fijos que la infra debe respetar:
+
+| Cosa | Valor | Por qué |
+|---|---|---|
+| Puerto de la app | `8080` | Uvicorn escucha en `0.0.0.0:8080` |
+| Health check path | `/health` | Devuelve `{"status":"ok"}` |
+| Módulo ASGI | `app.main:app` | Estructura del repo |
+
+Recursos de infraestructura — anotá los que **ya existen** y elegí nombre para los que faltan:
+
+| # | Recurso | Nombre / ID | ¿Ya existe? |
+|---|---|---|---|
+| 1 | VPC | `_____________` | ☐ |
+| 2 | Subred pública AZ-a | `subnet-_________` | ☐ |
+| 3 | Subred pública AZ-b | `subnet-_________` | ☐ |
+| 4 | Subred privada AZ-a | `subnet-_________` | ☐ |
+| 5 | Subred privada AZ-b | `subnet-_________` | ☐ |
+| 6 | Route table de las privadas | `rtb-_________` | ☐ |
+| 7 | Gateway VPC Endpoint de S3 | `BarrioFix-s3-endpoint` | ☐ |
+| 8 | Bucket de media (ya existe) | `barriofix-media-clara` | ☐ |
+| 9 | **Bucket de artefactos (NUEVO)** | `barriofix-artifacts-clara` | ☐ |
+| 10 | Instance profile | `LabInstanceProfile` | ✅ (viene del lab) |
+| 11 | Key pair (para el builder) | `_____________` | ☐ |
+| 12 | Security Group del ALB | `BarrioFix-alb-sg` | ☐ |
+| 13 | Security Group del backend | `BarrioFix-backend-sg` | ☐ |
+| 14 | AMI dorada (sale de la Fase 3) | `ami-_________` | ☐ |
+| 15 | Launch Template | `BarrioFix-backend-template` | ☐ |
+| 16 | Target Group | `BarrioFix-backend-tg` | ☐ |
+| 17 | Application Load Balancer | `BarrioFix-alb` | ☐ |
+| 18 | Auto Scaling Group | `BarrioFix-backend-asg` | ☐ |
+| 19 | Tu IP pública (para SSH al builder) | `____.____.____.___/32` | ☐ |
+
+> ⚠️ **El bucket de artefactos tiene que ser distinto al de media.** El endpoint
+> `GET /api/media` hace `list_objects_v2` sobre **todo** el bucket, así que si dejás el
+> `app.tar.gz` ahí, aparece listado en la API pública.
+
+---
+
+## Fase 1 — Bucket de artefactos
+
+Consola → **S3** → *Create bucket*
+
+- Name: `barriofix-artifacts-clara`
+- Region: la misma que todo lo demás (`us-east-1`)
+- **Block all public access: ACTIVADO** (se accede solo por el rol IAM, nunca público)
+- Versioning: activado (opcional, pero permite rollbackear un deploy malo)
+
+---
+
+## Fase 2 — Verificar el Gateway VPC Endpoint de S3
+
+Esto es lo que hace que todo funcione sin internet. Si falla, la instancia arranca sin app.
+
+Consola → **VPC** → *Endpoints* → `BarrioFix-s3-endpoint`
+
+Verificar:
+
+- **Type:** Gateway (NO Interface)
+- **Service name:** `com.amazonaws.us-east-1.s3`
+- **Route tables:** tiene que estar tildada la route table de las **subredes privadas** (#6).
+  Si no está, editar y asociarla.
+- **Policy:** *Full access* (o al menos permitir `s3:GetObject` y `s3:ListBucket` sobre los dos buckets)
+
+Después, en **VPC → Route tables → (la privada) → Routes**, tiene que aparecer una ruta con
+destino `pl-xxxxxxx (com.amazonaws.us-east-1.s3)` apuntando al endpoint.
+
+---
+
+## Fase 3 — Construir la AMI dorada (se hace UNA sola vez)
+
+### 3.1 Lanzar la instancia "builder"
+
+Consola → **EC2** → *Launch instance*
+
+- Name: `BarrioFix-builder`
+- AMI: **Amazon Linux 2023** (x86_64)
+- Instance type: `t3.micro`
+- Key pair: el de la tabla (#11)
+- Network: la VPC del proyecto, **subred PÚBLICA** (#2), **Auto-assign public IP: Enable**
+  → esta instancia SÍ necesita internet, es la única que lo va a tener
+- Security group: nuevo, `BarrioFix-builder-sg`, inbound SSH (22) solo desde tu IP (#19)
+- **Advanced details → IAM instance profile: `LabInstanceProfile`**
+
+### 3.2 Conectarse e instalar todo
+
+SSH a la instancia y correr:
+
+```bash
+sudo dnf install -y python3.11 python3.11-pip tar
+```
+
+```bash
+sudo useradd -r -s /sbin/nologin barriofix || true
+sudo mkdir -p /opt/barriofix
+sudo python3.11 -m venv /opt/barriofix/venv
+sudo /opt/barriofix/venv/bin/pip install --upgrade pip
+sudo /opt/barriofix/venv/bin/pip install fastapi "uvicorn[standard]" boto3
+```
+
+Verificar que quedó bien:
+
+```bash
+/opt/barriofix/venv/bin/python -c "import fastapi, uvicorn, boto3; print('deps ok')"
+```
+
+```bash
+aws --version
+```
+
+(AL2023 ya trae la CLI v2 preinstalada; el User Data la necesita para el `s3 cp`.)
+
+### 3.3 Escribir el servicio systemd
+
+Crear `/etc/systemd/system/barriofix-backend.service` con este contenido
+(`sudo nano /etc/systemd/system/barriofix-backend.service`):
+
+```ini
+[Unit]
+Description=BarrioFix Backend (FastAPI + Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=barriofix
+WorkingDirectory=/opt/barriofix
+Environment=AWS_REGION=us-east-1
+Environment=MEDIA_BUCKET=barriofix-media-clara
+Environment=CORS_ORIGINS=http://barriofix-frontend-clara.s3-website-us-east-1.amazonaws.com
+ExecStart=/opt/barriofix/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Y después:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+> `WorkingDirectory=/opt/barriofix` + el tarball que extrae `app/` ahí
+> ⇒ `/opt/barriofix/app/main.py` ⇒ `app.main:app` resuelve. No cambiar uno sin el otro.
+>
+> Estas son las **únicas tres variables** que el backend lee. Los valores y el detalle de
+> cómo obtener cada uno están documentados en [`.env.example`](../.env.example) en la raíz
+> del repo — si cambiás uno ahí, cambialo también acá: en EC2 no se lee ningún `.env`,
+> estos `Environment=` son la fuente de verdad.
+>
+> `CORS_ORIGINS` es opcional: si lo omitís, el default del código es `*` (cualquier origen),
+> que funciona igual para el lab.
+
+### 3.4 Limpiar antes de sacar la foto
+
+Muy importante: la AMI **no** debe llevar código de la app ni el servicio habilitado
+(el User Data se encarga de las dos cosas en cada arranque).
+
+```bash
+sudo rm -rf /opt/barriofix/app
+sudo systemctl disable barriofix-backend || true
+```
+
+### 3.5 Crear la AMI
+
+Consola → **EC2 → Instances** → seleccionar `BarrioFix-builder` →
+*Actions → Image and templates → Create image*
+
+- Image name: `BarrioFix-backend-ami-v1`
+- Esperar a que pase de `pending` a `available` (unos minutos)
+- **Anotar el `ami-xxxxxxxx`** → va a la fila #14 de la tabla
+
+### 3.6 Terminar el builder
+
+Ya no sirve y consume presupuesto del lab. *Instance state → Terminate*.
+
+---
+
+## Fase 4 — Subir el código a S3
+
+Desde la máquina local (PowerShell en Windows ya trae `tar`), parado en la raíz del repo:
+
+```bash
+tar --exclude=__pycache__ --exclude=venv -czf app.tar.gz app
+```
+
+Verificar el contenido — las rutas tienen que empezar con `app/`, no con `./` ni con una
+ruta absoluta:
+
+```bash
+tar -tzf app.tar.gz
+```
+
+Subirlo: Consola → **S3** → `barriofix-artifacts-clara` → *Upload* → `app.tar.gz`
+
+---
+
+## Fase 5 — Security Groups
+
+Crear dos, en este orden (el segundo referencia al primero).
+
+**`BarrioFix-alb-sg`** (para el load balancer)
+
+- Inbound: HTTP `80` desde `0.0.0.0/0`
+- Outbound: all traffic (default)
+
+**`BarrioFix-backend-sg`** (para las instancias)
+
+- Inbound: TCP `8080` con **source = `BarrioFix-alb-sg`** (el security group, NO un CIDR)
+- Outbound: all traffic (default) — necesario para llegar a S3 por el endpoint
+- **Sin regla de SSH**: están en subred privada, no hay cómo llegar igual
+
+---
+
+## Fase 6 — Launch Template
+
+Consola → **EC2 → Launch Templates** → *Create launch template*
+
+- Name: `BarrioFix-backend-template`
+- AMI: **la AMI dorada** de la Fase 3.5 (#14) — buscarla en la pestaña *My AMIs*
+- Instance type: `t3.micro`
+- Key pair: *Don't include* (no hay acceso SSH de todos modos)
+- **Subnet: "Don't include in launch template"** ← lo define el ASG
+- Security groups: `BarrioFix-backend-sg`
+- **Advanced details → IAM instance profile: `LabInstanceProfile`**
+- **Advanced details → User data:**
+
+```bash
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee /var/log/barriofix-userdata.log | logger -t userdata -s 2>/dev/console) 2>&1
+
+ARTIFACTS_BUCKET="barriofix-artifacts-clara"
+REGION="us-east-1"
+APP_DIR="/opt/barriofix"
+
+# Baja por el Gateway VPC Endpoint de S3, sin salir a internet.
+aws s3 cp "s3://${ARTIFACTS_BUCKET}/app.tar.gz" /tmp/app.tar.gz --region "${REGION}"
+
+rm -rf "${APP_DIR}/app"
+tar -xzf /tmp/app.tar.gz -C "${APP_DIR}"
+chown -R barriofix:barriofix "${APP_DIR}"
+
+systemctl enable --now barriofix-backend
+```
+
+> Cambiar `ARTIFACTS_BUCKET` y `REGION` si tus nombres son otros.
+
+---
+
+## Fase 7 — Target Group
+
+Consola → **EC2 → Target Groups** → *Create target group*
+
+- Target type: **Instances**
+- Name: `BarrioFix-backend-tg`
+- Protocol / Port: **HTTP / 8080**
+- VPC: la del proyecto
+- **Health checks:**
+  - Protocol: HTTP
+  - Path: **`/health`**
+  - Advanced: Port `traffic port`, Healthy threshold `2`, Unhealthy threshold `3`,
+    Timeout `5`, Interval `15`, Success codes `200`
+- **No registrar targets a mano** — los agrega el ASG
+
+---
+
+## Fase 8 — Application Load Balancer
+
+Consola → **EC2 → Load Balancers** → *Create* → **Application Load Balancer**
+
+- Name: `BarrioFix-alb`
+- Scheme: **Internet-facing**
+- IP address type: IPv4
+- VPC: la del proyecto
+- Mappings: las **dos subredes PÚBLICAS** (#2 y #3) — tiene que haber 2 AZ distintas
+- Security group: `BarrioFix-alb-sg` (quitar el `default` si aparece)
+- Listener: **HTTP : 80** → *Forward to* → `BarrioFix-backend-tg`
+
+**Anotar el DNS name** (`BarrioFix-alb-1234567890.us-east-1.elb.amazonaws.com`).
+
+---
+
+## Fase 9 — Auto Scaling Group
+
+Consola → **EC2 → Auto Scaling Groups** → *Create*
+
+- Name: `BarrioFix-backend-asg`
+- Launch template: `BarrioFix-backend-template` (Version: `Latest`)
+- VPC: la del proyecto
+- **Availability Zones and subnets: las dos subredes PRIVADAS** (#4 y #5)
+- *Attach to an existing load balancer* → *Choose from your load balancer target groups*
+  → `BarrioFix-backend-tg`
+- **Turn on Elastic Load Balancing health checks** ✅
+- **Health check grace period: `180` segundos** (le da tiempo al User Data a bajar y arrancar)
+- Group size: Desired `2`, Minimum `2`, Maximum `4`
+- Scaling policy: *Target tracking*, `Average CPU utilization`, target `50` (opcional)
+
+---
+
+## Fase 10 — Verificar
+
+Esperar ~3 minutos y chequear que el Target Group muestre los targets en **healthy**.
+Después, desde tu máquina (reemplazando el DNS del ALB):
+
+```bash
+curl http://BarrioFix-alb-XXXX.us-east-1.elb.amazonaws.com/health
+```
+
+Esperado: `{"status":"ok"}`
+
+```bash
+curl http://BarrioFix-alb-XXXX.us-east-1.elb.amazonaws.com/api/requests
+```
+
+Esperado: la lista de solicitudes hardcodeadas.
+
+```bash
+curl http://BarrioFix-alb-XXXX.us-east-1.elb.amazonaws.com/api/media
+```
+
+Esperado: la lista de objetos del bucket de media. **Este es el test que valida el
+Gateway VPC Endpoint** — si devuelve `502 No se pudo listar el bucket`, el endpoint
+o los permisos de `LabRole` están mal.
+
+> Ojo: `POST /api/requests` guarda **en memoria**. Con 2 instancias detrás del ALB,
+> lo que creás en una no lo ve la otra. Es esperado — todavía no hay base de datos.
+
+---
+
+## Redeploy (el loop de todos los días)
+
+1. `tar --exclude=__pycache__ --exclude=venv -czf app.tar.gz app`
+2. Subir `app.tar.gz` a `barriofix-artifacts-clara` (pisa el anterior)
+3. **EC2 → Auto Scaling Groups → `BarrioFix-backend-asg` → Instance refresh → Start**
+   - Minimum healthy percentage: `50`
+
+Solo hay que rehacer la AMI (Fase 3) si **cambian las dependencias** de `requirements.txt`.
+
+---
+
+## Troubleshooting
+
+**Los targets quedan `unhealthy` / la instancia arranca sin app**
+
+Las instancias están en subred privada sin SSH, así que no se puede entrar a mirar.
+Opciones, de menos a más trabajo:
+
+1. **System log:** EC2 → la instancia → *Actions → Monitor and troubleshoot → Get system log*.
+   El User Data loguea a la consola (`2>/dev/console`), así que los errores del
+   `aws s3 cp` aparecen ahí.
+2. **Reproducir en público:** lanzar una instancia suelta con la misma AMI y el mismo User Data
+   pero en subred **pública** con IP pública y SSH. Si ahí funciona y en privada no,
+   el problema es el VPC Endpoint.
+3. Dentro de una instancia a la que sí puedas entrar:
+   ```bash
+   sudo cat /var/log/cloud-init-output.log
+   sudo journalctl -u barriofix-backend -n 50 --no-pager
+   curl localhost:8080/health
+   ```
+
+**Causas más comunes, en orden:**
+
+| Síntoma | Causa probable |
+|---|---|
+| El User Data cuelga y timeoutea en `aws s3 cp` | El endpoint no está asociado a la route table de las privadas (Fase 2) |
+| `AccessDenied` en el `s3 cp` | `LabRole` sin `s3:GetObject` sobre el bucket de artefactos |
+| TG unhealthy pero la app corre | El SG del backend no permite `8080` desde el SG del ALB |
+| TG unhealthy, health check 404 | Path del health check mal escrito (es `/health`, sin barra final) |
+| `ModuleNotFoundError: app` | El tarball se armó desde adentro de `app/` en vez de la raíz del repo |
+| `502` en `/api/media` | El endpoint funciona para artefactos pero falta permiso sobre el bucket de media |
+
+**Session Manager (SSM) para entrar a las privadas:** solo funciona si creás *interface*
+endpoints para `ssm`, `ssmmessages` y `ec2messages`. En el Learner Lab eso suma costo y
+puede no estar permitido — por eso la guía asume que no hay acceso interactivo a las
+instancias de producción.

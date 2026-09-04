@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 router = APIRouter(prefix="/api/media", tags=["media"])
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-MEDIA_BUCKET = os.environ.get("MEDIA_BUCKET", "barriofix-media-grupo10")
+MEDIA_BUCKET = os.environ.get("MEDIA_BUCKET", "barriofix-media-clara")
 
 # Credentials come from the instance's IAM role (LabInstanceProfile) via the
 # instance metadata service. Requests to S3 from the private subnets go out
