@@ -1,6 +1,8 @@
 # BarrioFix API — guía para el frontend
 
-Todo lo de acá está verificado contra el backend desplegado el 2026-09-04.
+> **Contrato v2 (RDS + autenticación).** Reemplaza por completo la versión con datos
+> en memoria. Nada de lo anterior sigue vigente: cambiaron los ids, los estados, las
+> rutas y ahora todo pide token.
 
 ---
 
@@ -10,279 +12,277 @@ Todo lo de acá está verificado contra el backend desplegado el 2026-09-04.
 http://barriofix-alb-793636717.us-east-1.elb.amazonaws.com
 ```
 
-> ⚠️ **Hay un segundo ALB, `barriofix-alb-1097909841`, que está MUERTO.**
-> Devuelve `503` en absolutamente todo, incluido `/health`. Si el frontend le pega a ese,
-> el browser muestra **"CORS error"** en la consola — pero el problema no es CORS: un `503`
-> lo genera el ALB, no la app, así que la respuesta sale sin headers CORS y el browser lo
-> etiqueta mal. Si ves "CORS error", **lo primero es mirar el status del preflight**.
->
-> Regla rápida para distinguirlos: el ALB vivo termina en `793636717`.
+> ⚠️ Hay un segundo ALB, `barriofix-alb-1097909841`, **muerto**: devuelve `503` en
+> todo, incluido `/health`. Un `503` lo genera el ALB, no la app, así que sale sin
+> headers CORS y el browser lo reporta como **"CORS error"**. Si ves eso, mirá primero
+> el status del preflight antes de tocar nada de CORS.
 
-Verificación de un vistazo:
-
-```bash
-curl.exe http://barriofix-alb-793636717.us-east-1.elb.amazonaws.com/health
-```
-
-Tiene que devolver `{"status":"ok"}`. Si devuelve `503`, el problema es de infra
-(targets unhealthy), no del frontend — no toques el código, avisá.
-
-### HTTP, no HTTPS
-
-El ALB solo escucha en **puerto 80 / HTTP**. No hay certificado.
-Como el frontend también se sirve por HTTP desde el website endpoint de S3, no hay
-problema de *mixed content*. Pero si algún día el frontend pasa a HTTPS (CloudFront,
-por ejemplo), el browser va a bloquear todas estas llamadas por ser HTTP.
+Solo HTTP, puerto 80. No hay listener 443.
 
 ---
 
-## 2. CORS
+## 2. Qué cambió respecto de la versión anterior
 
-El backend acepta requests **solo** desde este origen exacto:
-
-```
-http://barriofix-frontend-clara.s3-website-us-east-1.amazonaws.com
-```
-
-Implicancias prácticas:
-
-- Abrir el frontend desde `localhost` **no va a funcionar** contra este backend.
-  Si lo necesitás para desarrollo, pedí que agreguen tu origen a la lista.
-- La URL tiene que coincidir **carácter por carácter** con la barra del browser.
-  `s3-website-us-east-1` (con guión) y `s3-website.us-east-1` (con punto) son
-  ambas válidas en AWS pero son **orígenes distintos** para CORS. Usá la que te
-  muestra la consola de S3.
-- `allow_credentials` está en `true`, así que podés mandar cookies si alguna vez hace
-  falta. Hoy no hay autenticación, así que no mandes `credentials: "include"` sin motivo.
-
----
-
-## 3. Endpoints
-
-Todas las respuestas son JSON. No hay autenticación: no mandes `Authorization`.
-
-### Salud
-
-| Método | Path | Respuesta |
+| | Antes | Ahora |
 |---|---|---|
-| `GET` | `/health` | `{"status":"ok"}` |
-| `GET` | `/` | `{"message":"BarrioFix Backend - Servidor funcionando correctamente"}` |
+| Ids | `"BF-1042"` | enteros (`42`) |
+| Autenticación | ninguna | **JWT obligatorio** en casi todo |
+| Estados | `pendiente`, `en_progreso`, `completado` | `PENDIENTE`, `ASIGNADO`, `EN_PROGRESO`, `RESUELTO`, `CANCELADO` |
+| Cliente | string libre (`"Marisol Peña"`) | usuario real, sale del token |
+| Zona | no existía | **obligatoria** al crear |
+| Categoría / urgencia | string (`"Plomería"`) | id numérico contra catálogo |
+| Ruta de solicitudes | `/api/requests` | `/api/solicitudes` |
+| Trabajos | `/api/jobs` | `/api/trabajos` |
+| Fotos | `/api/media` sobre el bucket entero | `/api/solicitudes/{id}/fotos`, ligadas a una solicitud |
 
-`/health` lo usa el Target Group del ALB. No lo uses para lógica de negocio.
+---
+
+## 3. Autenticación
+
+### Registro
+
+```
+POST /api/auth/registro
+```
+
+```json
+{
+  "username": "anagomez",
+  "password": "mínimo 8 caracteres",
+  "nombre": "Ana",
+  "apellido": "Gómez",
+  "email": "ana@ejemplo.com",
+  "telefono": "11 5555 5555",
+  "como_cliente": true,
+  "como_profesional": false,
+  "descripcion_profesional": null,
+  "categorias": []
+}
+```
+
+Un usuario puede ser cliente **y** profesional a la vez. Si `como_profesional` es
+`true`, `categorias` es la lista de ids de especialidades.
+
+### Login
+
+```
+POST /api/auth/login     → { username, password }        (el que usa el front)
+POST /api/auth/token     → form-urlencoded               (para el Authorize de /docs)
+```
+
+Los dos devuelven:
+
+```json
+{
+  "access_token": "eyJ...",
+  "token_type": "bearer",
+  "usuario": { "id_usuario": 1, "nombre": "Ana", "es_cliente": true, "es_profesional": false, "es_admin": false, ... }
+}
+```
+
+### Usar el token
+
+```
+Authorization: Bearer <access_token>
+```
+
+Dura **12 horas** por defecto. Cuando vence, la API responde `401`: el cliente borra
+el token y manda al login.
+
+**Endpoints sin token:** `/health`, `/health/db`, `/`, `/api/auth/registro`,
+`/api/auth/login`, `/api/auth/token`, los catálogos (`GET /api/categorias`, `/api/zonas`,
+`/api/urgencias`, `/api/estados`) y `GET /api/fotos/{id}/contenido`.
+
+Los catálogos son públicos a propósito: el formulario de registro necesita la lista de
+categorías antes de que exista un token. Y el binario de las fotos también, porque el
+browser no manda `Authorization` en un `<img src>`.
+
+---
+
+## 4. Máquina de estados
+
+```
+PENDIENTE ──aceptar──> ASIGNADO ──iniciar──> EN_PROGRESO ──resolver──> RESUELTO
+    │                     │                       │
+    └─────────────────────┴───────cancelar────────┴──────────────> CANCELADO
+```
+
+| Endpoint | Transición | Quién |
+|---|---|---|
+| `POST /api/solicitudes/{id}/aceptar` | `PENDIENTE → ASIGNADO` | profesional |
+| `POST /api/solicitudes/{id}/iniciar` | `ASIGNADO → EN_PROGRESO` | el profesional asignado |
+| `POST /api/solicitudes/{id}/resolver` | `EN_PROGRESO → RESUELTO` | el profesional asignado |
+| `POST /api/solicitudes/{id}/cancelar` | `* → CANCELADO` | el cliente dueño |
+
+Body opcional: `{ "motivo": "texto" }`. Todos devuelven la **solicitud completa
+actualizada** — usala directo para actualizar el estado local en vez de refetchear.
+
+Una transición inválida devuelve **`409`** con el motivo. `409` al aceptar es normal y
+esperable: otro profesional la tomó primero.
+
+---
+
+## 5. Endpoints del flujo de usuario
+
+### Catálogos (para llenar los selects)
+
+```
+GET /api/categorias?activo=true     → [{ id_categoria, nombre, descripcion, activo }]
+GET /api/zonas?activo=true          → [{ id_zona, nombre, ... }]
+GET /api/urgencias?activo=true      → [{ id_urgencia, nombre, orden_prioridad, ... }]
+```
 
 ### Solicitudes
 
-| Método | Path | Body | Devuelve |
-|---|---|---|---|
-| `GET` | `/api/requests` | — | array de solicitudes |
-| `GET` | `/api/requests?categoria=X&estado=Y` | — | array filtrado |
-| `GET` | `/api/requests/{id}` | — | una solicitud, o `404` |
-| `POST` | `/api/requests` | `NewRequest` | la solicitud creada, **`201`** |
-| `PATCH` | `/api/requests/{id}/accept` | `{"profesional": "..."}` | la solicitud actualizada |
-| `PATCH` | `/api/requests/{id}/status` | `{"estado": "..."}` | la solicitud actualizada |
-| `POST` | `/api/requests/{id}/rate` | `{"rating": 5, "comentario": "..."}` | la solicitud actualizada |
+```
+GET    /api/solicitudes?estado=&id_categoria=&id_zona=&id_urgencia=&mias=&asignadas=
+GET    /api/solicitudes/{id}
+POST   /api/solicitudes                        → 201
+PUT    /api/solicitudes/{id}                   → solo mientras esté PENDIENTE
+GET    /api/solicitudes/{id}/seguimiento       → historial completo
+```
 
-`POST /api/requests` devuelve **201**, no 200. Si chequeás `res.status === 200` te va a
-fallar. Usá `res.ok`.
+`mias=true` filtra las que creaste como cliente; `asignadas=true`, las que tenés como
+profesional.
 
-Body de `NewRequest` — los seis campos son **obligatorios**, si falta uno devuelve `422`:
+Body de `POST` / `PUT`:
 
 ```json
 {
   "titulo": "Pérdida de agua bajo la pileta",
-  "categoria": "Plomería",
-  "direccion": "Calle Los Aromos 214, Villa Alegre",
-  "descripcion": "Gotea agua debajo de la bacha.",
-  "urgencia": "Alta",
-  "cliente": "Marisol Peña"
+  "descripcion": "Gotea cada vez que se usa.",
+  "direccion": "Los Aromos 214",
+  "id_categoria": 1,
+  "id_urgencia": 3,
+  "id_zona": 1
 }
 ```
 
-El backend le agrega solo: `id`, `profesional` (`null`), `estado` (`"pendiente"`),
-`rating` (`null`), `comentario` (`""`), `creado`, `fotos` (`[]`).
+### Trabajos disponibles (profesional)
 
-`PATCH .../accept` además de asignar el profesional pone `estado` en `"en_progreso"`
-automáticamente. No hace falta llamar a `/status` después.
-
-`comentario` en `rate` es opcional (default `""`); `rating` es obligatorio y es un entero.
-
-### Trabajos disponibles
-
-| Método | Path | Devuelve |
-|---|---|---|
-| `GET` | `/api/jobs` | solicitudes con `estado == "pendiente"` |
-| `GET` | `/api/jobs?categoria=X&urgencia=Y` | ídem, filtrado |
-
-Es una vista de solo lectura sobre las mismas solicitudes — no es una entidad aparte.
-`GET /api/jobs` ≡ `GET /api/requests?estado=pendiente`.
-
-### Media (S3)
-
-| Método | Path | Devuelve |
-|---|---|---|
-| `GET` | `/api/media` | array de `{key, size, last_modified}` |
-| `GET` | `/api/media?prefix=fotos/` | ídem, filtrado por prefijo |
-| `GET` | `/api/media/{key}` | el archivo binario, con su `Content-Type` |
-
-Respuesta real del bucket hoy:
-
-```json
-[
-  {"key":"WhatsApp Image 2020-12-09 at 10.13.55 PM.jpeg","size":169695,"last_modified":"2026-09-04T05:32:28+00:00"},
-  {"key":"WhatsApp Image 2020-12-15 at 12.05.22 AM.jpeg","size":163999,"last_modified":"2026-09-04T05:32:29+00:00"}
-]
+```
+GET /api/trabajos?id_zona=&id_urgencia=&todas_las_categorias=
 ```
 
-> ⚠️ **Las keys tienen espacios.** Hay que encodearlas o el request falla:
->
-> ```js
-> const url = `${API}/api/media/${encodeURIComponent(item.key)}`;
-> ```
->
-> Verificado: con la key encodeada devuelve `200 image/jpeg 169695 bytes`.
+Devuelve las `PENDIENTE` **filtradas por las especialidades del profesional**.
+`todas_las_categorias=true` levanta ese filtro.
 
-Para mostrar una imagen podés usar esa URL directo en un `<img src>` — el endpoint
-devuelve el binario con el `Content-Type` correcto.
+### Fotos
+
+```
+GET    /api/solicitudes/{id}/fotos
+POST   /api/solicitudes/{id}/fotos     multipart: archivo, tipo_foto, descripcion
+GET    /api/fotos/{id}/contenido       binario, sin token → va en <img src>
+PATCH  /api/fotos/{id}
+DELETE /api/fotos/{id}                 borra la fila Y el objeto de S3
+```
+
+`tipo_foto` ∈ `ANTES` · `DESPUES` · `OTRA`. Máximo 10 MB.
+
+**No armes la URL a mano** con `s3_key`: usá `/api/fotos/{id}/contenido`. El campo `url`
+de la respuesta ya trae esa ruta.
+
+### Calificación
+
+```
+GET  /api/solicitudes/{id}/calificacion
+POST /api/solicitudes/{id}/calificacion    { puntuacion: 1-5, comentario }
+PUT  /api/calificaciones/{id}
+GET  /api/profesionales/{id}/calificaciones
+```
+
+Solo el cliente dueño, solo si está `RESUELTO`, y **una sola vez** (`409` si ya existe).
+
+### Perfil y profesionales
+
+```
+GET   /api/auth/me
+PUT   /api/auth/me
+PATCH /api/auth/me/password
+POST  /api/usuarios/{id}/profesional          alta como profesional
+GET   /api/profesionales?id_categoria=&disponible=
+GET   /api/profesionales/{id}                 incluye promedio y trabajos resueltos
+PUT   /api/profesionales/{id}
+PATCH /api/profesionales/{id}/disponible
+GET   /api/profesionales/{id}/categorias
+PUT   /api/profesionales/{id}/categorias      reemplaza el set completo
+```
 
 ---
 
-## 4. Modelo de datos
+## 6. Forma de una solicitud
 
 ```ts
 type Solicitud = {
-  id: string;            // "BF-1042"
-  titulo: string;
-  categoria: string;
-  direccion: string;
-  descripcion: string;
-  urgencia: string;
-  cliente: string;
-  profesional: string | null;
-  estado: "pendiente" | "en_progreso" | "completado";
-  creado: string;        // "2026-08-24"
-  rating: number | null;
-  comentario: string;
-  fotos: string[];
-};
+  id_solicitud: number
+  titulo: string
+  descripcion: string
+  direccion: string
+  fecha_creacion: string          // ISO 8601 con timezone
+  cancelada_por_cliente: boolean
+  fecha_cancelacion_cliente: string | null
+
+  categoria: { id_categoria: number; nombre: string; descripcion: string | null; activo: boolean }
+  urgencia:  { id_urgencia: number; nombre: string; orden_prioridad: number; activo: boolean }
+  zona:      { id_zona: number; nombre: string; descripcion: string | null; activo: boolean }
+  cliente:   { id_usuario: number; nombre: string; apellido: string }
+
+  // Derivados del seguimiento abierto, no son columnas de la tabla.
+  estado:      { id_estado: number; nombre: string; es_inicial: boolean; es_final: boolean; activo: boolean }
+  profesional: { id_usuario: number; nombre: string; apellido: string } | null
+
+  calificacion: { id_calificacion: number; puntuacion: number; comentario: string | null; fecha_calificacion: string } | null
+  fotos: Array<{ id_foto: number; tipo_foto: string; s3_key: string; nombre_archivo: string; url: string; ... }>
+}
 ```
 
-Valores válidos (el backend **no los valida**, son convención):
-
-- `categoria`: `Plomería`, `Electricidad`, `Carpintería`, `Pintura`, `Albañilería`, `Otro`
-- `urgencia`: `Baja`, `Media`, `Alta`
-- `estado`: `pendiente`, `en_progreso`, `completado`
-
-Los filtros por query string son **case-sensitive y con acentos**:
-`?categoria=Plomería` funciona, `?categoria=plomeria` devuelve `[]`.
+`estado` y `profesional` vienen como **objetos anidados**, no strings. Para mostrar el
+estado usá `solicitud.estado.nombre`.
 
 ---
 
-## 5. Errores
-
-Todos los errores vienen con esta forma:
+## 7. Errores
 
 ```json
-{"detail": "Solicitud no encontrada"}
+{ "detail": "La solicitud ya esta en estado final (RESUELTO)" }
 ```
+
+En los `422` de validación, `detail` es un **array** de objetos Pydantic, no un string.
+Hay que contemplar los dos casos al mostrar el mensaje.
 
 | Status | Cuándo |
 |---|---|
-| `404` | id inexistente (`{"detail":"Solicitud no encontrada"}`) |
-| `422` | body inválido o campo faltante — `detail` es un array de errores de Pydantic |
-| `502` | el backend no pudo hablar con S3 (solo endpoints de media) |
+| `401` | falta el token, o venció → borrar token y mandar al login |
+| `403` | autenticado pero sin permiso (rol equivocado, recurso de otro) |
+| `404` | no existe |
+| `409` | choca con una regla de negocio: transición inválida, ya calificada, trabajo ya tomado, catálogo en uso |
+| `413` | foto de más de 10 MB |
+| `422` | body inválido |
+| `502` | el backend no pudo hablar con S3 |
 | `503` | **no llegaste a la app**: el ALB no tiene targets healthy |
 
 ---
 
-## 6. Trampas verificadas
+## 8. Trampas
 
-### La barra final rompe el request
+**No hay más estado en memoria compartido entre instancias.** Con RDS, las dos
+instancias del ASG ven exactamente lo mismo. El problema de "creo algo y no aparece" de
+la versión anterior desapareció.
 
-`/api/requests/` (con barra) devuelve **`307` redirect** a `/api/requests`.
-En un `fetch` con CORS, el redirect del preflight puede fallar de formas confusas.
-**Nunca pongas barra final.**
+**`zona` es obligatoria.** El formulario tiene que pedirla o el `POST` devuelve `422`.
 
-Verificado:
+**La barra final sigue rompiendo.** `/api/solicitudes/` devuelve `307`. Nunca la pongas.
 
-```
-/api/requests   -> 200
-/api/requests/  -> 307
-```
-
-### El estado NO se comparte entre instancias
-
-Hay **2 instancias** detrás del ALB y los datos viven **en memoria de cada proceso**.
-No hay base de datos. Un `POST` cae en una sola instancia; los `GET` siguientes
-alternan entre las dos.
-
-Esto es lo que pasó en una prueba real: creé una solicitud y después hice 6 `GET` seguidos:
-
-```
-GET 1: no aparece
-GET 2: no aparece
-GET 3: SÍ aparece
-GET 4: no aparece
-GET 5: SÍ aparece
-GET 6: SÍ aparece
-```
-
-**Consecuencias para el frontend:**
-
-- Después de un `POST`/`PATCH`, **no refetchees la lista** esperando ver el cambio.
-  Usá la respuesta del propio `POST`/`PATCH` (devuelve el objeto completo) para
-  actualizar el estado local.
-- Cualquier cosa creada se pierde en el próximo redeploy. Para la demo, apoyate en
-  los 3 registros hardcodeados (`BF-1042`, `BF-1039`, `BF-1031`).
-- Si en una demo en vivo algo "desaparece y reaparece", es esto, no un bug del frontend.
-
-> Hoy hay un registro basura `BF-1043 "PRUEBA smoke test"` en una de las dos instancias,
-> de un test de verificación. Desaparece solo en el próximo redeploy.
+**Los ids son números.** Si el front hace `String(id)` o los usa como clave de objeto,
+funciona igual; si los compara con `===` contra un string, no.
 
 ---
 
-## 7. Snippet de arranque
-
-```js
-const API = "http://barriofix-alb-793636717.us-east-1.elb.amazonaws.com";
-
-async function api(path, options = {}) {
-  const res = await fetch(`${API}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-  if (res.status === 503) {
-    throw new Error("Backend caído (ALB sin targets healthy) — no es un bug del front");
-  }
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail ?? `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-// Uso
-const solicitudes = await api("/api/requests");
-const pendientes  = await api("/api/jobs");
-const creada      = await api("/api/requests", {
-  method: "POST",
-  body: JSON.stringify({
-    titulo: "…", categoria: "Plomería", direccion: "…",
-    descripcion: "…", urgencia: "Alta", cliente: "…",
-  }),
-});
-// Usá `creada` directo para actualizar el estado local — NO refetchees la lista.
-```
-
----
-
-## 8. Docs interactiva
-
-FastAPI expone Swagger UI, útil para probar sin escribir código:
+## 9. Docs interactiva
 
 ```
 http://barriofix-alb-793636717.us-east-1.elb.amazonaws.com/docs
 ```
+
+El botón **Authorize** funciona: usa `POST /api/auth/token`. Es la forma más rápida de
+probar el flujo completo sin escribir una línea de código, y sirve para la demo.

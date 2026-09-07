@@ -46,6 +46,7 @@ Recursos de infraestructura — anotá los que **ya existen** y elegí nombre pa
 | 7 | Gateway VPC Endpoint de S3 | `BarrioFix-s3-endpoint` | ☐ |
 | 8 | Bucket de media (ya existe) | `barriofix-media-clara` | ☐ |
 | 9 | **Bucket de artefactos (NUEVO)** | `barriofix-artifacts-clara` | ☐ |
+| 9b | **Bucket de logs (NUEVO)** | `barriofix-logs-clara` | ☐ |
 | 10 | Instance profile | `LabInstanceProfile` | ✅ (viene del lab) |
 | 11 | Key pair (para el builder) | `_____________` | ☐ |
 | 12 | Security Group del ALB | `BarrioFix-alb-sg` | ☐ |
@@ -72,6 +73,17 @@ Consola → **S3** → *Create bucket*
 - **Block all public access: ACTIVADO** (se accede solo por el rol IAM, nunca público)
 - Versioning: activado (opcional, pero permite rollbackear un deploy malo)
 
+Y un segundo bucket para los logs, `barriofix-logs-clara`:
+
+- **Block all public access: ACTIVADO**
+- Versioning: **desactivado** (los logs no se editan; versionarlos solo ocupa lugar)
+- **Management → Create lifecycle rule**: expirar objetos a los 30 días. Sin esto, un
+  bucket de logs crece para siempre y en el Learner Lab el presupuesto es finito.
+
+> Tres buckets separados a propósito: media es lo único que la API expone, artefactos
+> es código, y logs es escritura constante con lifecycle propio. Mezclarlos hace que
+> `GET /api/media` liste cosas que no son fotos.
+
 ---
 
 ## Fase 2 — Verificar el Gateway VPC Endpoint de S3
@@ -86,7 +98,12 @@ Verificar:
 - **Service name:** `com.amazonaws.us-east-1.s3`
 - **Route tables:** tiene que estar tildada la route table de las **subredes privadas** (#6).
   Si no está, editar y asociarla.
-- **Policy:** *Full access* (o al menos permitir `s3:GetObject` y `s3:ListBucket` sobre los dos buckets)
+- **Policy:** *Full access* (o al menos `s3:GetObject` + `s3:ListBucket` sobre media y
+  artefactos, **y `s3:PutObject` sobre el de logs**)
+
+> ⚠️ Si la policy del endpoint está restringida por bucket, agregale el de logs. Si no,
+> el `aws s3 cp` de logrotate falla en silencio dentro de un `postrotate` — y logrotate
+> no reporta ese error a ningún lado.
 
 Después, en **VPC → Route tables → (la privada) → Routes**, tiene que aparecer una ruta con
 destino `pl-xxxxxxx (com.amazonaws.us-east-1.s3)` apuntando al endpoint.
@@ -158,6 +175,12 @@ ExecStart=/opt/barriofix/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 808
 Restart=always
 RestartSec=5
 
+# Ademas del journal, a un archivo que logrotate sube a S3 (paso 3.3b).
+# systemd abre el archivo como root antes de bajar a User=barriofix, asi que
+# no hace falta darle permisos al usuario del servicio.
+StandardOutput=append:/var/log/barriofix-app.log
+StandardError=append:/var/log/barriofix-app.log
+
 [Install]
 WantedBy=multi-user.target
 ```
@@ -179,6 +202,145 @@ sudo systemctl daemon-reload
 > `CORS_ORIGINS` es opcional: si lo omitís, el default del código es `*` (cualquier origen),
 > que funciona igual para el lab.
 
+
+### 3.3b Enviar los logs a S3
+
+Las instancias no tienen internet, asi que para mandar logs a CloudWatch habria que
+crear un **Interface Endpoint** (~USD 14-15/mes por dos AZ, mas el ingestion). Para S3
+ya tenemos el **Gateway Endpoint gratis** funcionando. Con presupuesto de Learner Lab,
+S3 gana.
+
+El precio de esa decision: hasta 15 minutos de logs perdidos si una instancia muere de
+golpe, y para buscar hay que bajar los archivos y grepear (o montar Athena encima).
+
+| | S3 directo (lo que hacemos) | CloudWatch Logs |
+|---|---|---|
+| Endpoint necesario | Gateway (**gratis**, ya existe) | Interface (**~USD 14-15/mes** en 2 AZ) |
+| Costo de datos | ~USD 0,023/GB/mes de storage | Storage + ingestion |
+| Perdida si la instancia muere | Hasta el intervalo del timer (15 min) | Practicamente nula |
+| Buscar y filtrar | Bajar y grepear, o Athena | Nativo: Logs Insights, alarmas |
+| Implementacion | logrotate + timer (manual) | El agente lo resuelve solo |
+
+> Para el informe: CloudWatch es lo recomendado en produccion real, pero aca el
+> Interface Endpoint cuesta mas por mes que todo el resto de la infraestructura junta
+> y no lo necesitamos para ninguna otra cosa. Es una decision de costo justificada por
+> la topologia de red, no una simplificacion por comodidad.
+
+#### El script de subida
+
+Va en un archivo aparte y no inline en el `postrotate`, porque necesita varias lineas
+y logrotate no reporta errores de esos scripts a ningun lado.
+
+```bash
+sudo tee /usr/local/bin/barriofix-subir-logs.sh > /dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+LOGS_BUCKET="barriofix-logs-clara"
+REGION="us-east-1"
+ARCHIVO="/var/log/barriofix-app.log.1.gz"
+
+[ -s "$ARCHIVO" ] || exit 0
+
+# IMDSv2: Amazon Linux 2023 exige el token. Sin el, el curl devuelve 401,
+# INSTANCE_ID queda vacio y TODAS las instancias suben a la misma key,
+# pisandose entre si — justo lo que el prefijo por instancia evita.
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token"     -H "X-aws-ec2-metadata-token-ttl-seconds: 60") || TOKEN=""
+INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN"     "http://169.254.169.254/latest/meta-data/instance-id") || INSTANCE_ID="desconocida"
+
+DESTINO="s3://${LOGS_BUCKET}/${INSTANCE_ID}/$(date -u +%Y/%m/%d/%H%M%S).log.gz"
+
+if aws s3 cp "$ARCHIVO" "$DESTINO" --region "$REGION"; then
+    rm -f "$ARCHIVO"
+else
+    # Se deja el archivo: el proximo ciclo lo reintenta en vez de perderlo.
+    logger -t barriofix-logs "Fallo la subida de $ARCHIVO a $DESTINO"
+    exit 1
+fi
+EOF
+
+sudo chmod 755 /usr/local/bin/barriofix-subir-logs.sh
+```
+
+#### La configuracion de logrotate
+
+```bash
+sudo tee /etc/logrotate.d/barriofix > /dev/null <<'EOF'
+/var/log/barriofix-app.log {
+    hourly
+    rotate 1
+    missingok
+    notifempty
+    compress
+
+    # CRITICO: systemd mantiene abierto el descriptor del archivo por el
+    # StandardOutput=append. Con la rotacion normal (renombrar y crear uno
+    # nuevo) uvicorn seguiria escribiendo al archivo VIEJO y el nuevo quedaria
+    # vacio para siempre. copytruncate copia y vacia en el lugar, asi que el
+    # descriptor sigue siendo valido.
+    copytruncate
+
+    postrotate
+        /usr/local/bin/barriofix-subir-logs.sh || true
+    endscript
+}
+EOF
+```
+
+> `rotate 1`, no `rotate 0`: con `0` logrotate borra el archivo rotado en el mismo
+> ciclo y el `.1.gz` puede no existir cuando corre el `postrotate`. Con `1` sobrevive
+> hasta que el script lo sube y lo borra el mismo.
+
+#### El timer
+
+logrotate corre una vez por dia por defecto. Para una ventana de 15 minutos:
+
+```bash
+sudo tee /etc/systemd/system/barriofix-logs.service > /dev/null <<'EOF'
+[Unit]
+Description=Rotar y subir a S3 los logs de BarrioFix
+
+[Service]
+Type=oneshot
+# -f fuerza la rotacion ignorando el "hourly" del archivo de config; sin esto
+# logrotate rotaria una vez por hora aunque el timer corra cada 15 minutos.
+# notifempty se sigue respetando, asi que un log vacio no sube nada.
+ExecStart=/usr/sbin/logrotate -f /etc/logrotate.d/barriofix
+EOF
+
+sudo tee /etc/systemd/system/barriofix-logs.timer > /dev/null <<'EOF'
+[Unit]
+Description=Subir los logs de BarrioFix a S3 cada 15 minutos
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable barriofix-logs.timer
+```
+
+> El timer **si** se deja habilitado en la AMI (a diferencia del servicio de la app):
+> no depende del codigo, solo del archivo de log, asi que arranca solo en cada
+> instancia nueva sin que el User Data haga nada.
+
+#### Probarlo en el builder antes de sacar la foto
+
+```bash
+echo "prueba de log" | sudo tee -a /var/log/barriofix-app.log
+sudo /usr/sbin/logrotate -f /etc/logrotate.d/barriofix
+aws s3 ls s3://barriofix-logs-clara/ --recursive
+```
+
+Tiene que aparecer un objeto bajo `<instance-id>/YYYY/MM/DD/HHMMSS.log.gz`. Si el
+prefijo dice `desconocida/`, fallo la consulta a IMDSv2 y hay que revisarlo **ahora**,
+antes de hornear la AMI.
+
 ### 3.4 Limpiar antes de sacar la foto
 
 Muy importante: la AMI **no** debe llevar código de la app ni el servicio habilitado
@@ -187,7 +349,15 @@ Muy importante: la AMI **no** debe llevar código de la app ni el servicio habil
 ```bash
 sudo rm -rf /opt/barriofix/app
 sudo systemctl disable barriofix-backend || true
+
+# Los logs de prueba del builder no tienen que viajar dentro de la imagen:
+# apareceria la misma linea en todas las instancias que nazcan de ella.
+sudo rm -f /var/log/barriofix-app.log*
 ```
+
+> El timer `barriofix-logs.timer` queda **habilitado** a proposito. El unico que se
+> deshabilita es `barriofix-backend`, porque ese lo enciende el User Data despues de
+> bajar el codigo.
 
 ### 3.5 Crear la AMI
 
@@ -397,6 +567,9 @@ Opciones, de menos a más trabajo:
 | TG unhealthy, health check 404 | Path del health check mal escrito (es `/health`, sin barra final) |
 | `ModuleNotFoundError: app` | El tarball se armó desde adentro de `app/` en vez de la raíz del repo |
 | `502` en `/api/media` | El endpoint funciona para artefactos pero falta permiso sobre el bucket de media |
+| El bucket de logs queda vacio | La policy del Gateway Endpoint no permite `s3:PutObject` ahi, o `LabRole` no tiene permiso |
+| Los logs suben bajo el prefijo `desconocida/` | Fallo IMDSv2: revisar el token en `barriofix-subir-logs.sh` |
+| `barriofix-app.log` deja de crecer despues de la primera rotacion | Falta `copytruncate`: systemd sigue escribiendo al archivo viejo |
 
 **Session Manager (SSM) para entrar a las privadas:** solo funciona si creás *interface*
 endpoints para `ssm`, `ssmmessages` y `ec2messages`. En el Learner Lab eso suma costo y
