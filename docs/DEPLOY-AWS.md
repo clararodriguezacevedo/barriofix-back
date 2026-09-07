@@ -168,9 +168,11 @@ Wants=network-online.target
 Type=simple
 User=barriofix
 WorkingDirectory=/opt/barriofix
-Environment=AWS_REGION=us-east-1
-Environment=MEDIA_BUCKET=barriofix-media-clara
-Environment=CORS_ORIGINS=http://barriofix-frontend-clara.s3-website-us-east-1.amazonaws.com
+# TODAS las variables vienen de un unico archivo en S3 que el User Data baja
+# al arrancar. Ver Fase 4 para crearlo y Fase 6 para el User Data. No hay
+# Environment= sueltos ni valores horneados en la AMI: cambiar la password
+# de la base o el JWT_SECRET es re-subir el archivo, sin rehacer la imagen.
+EnvironmentFile=/opt/barriofix/backend.env
 ExecStart=/opt/barriofix/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
 Restart=always
 RestartSec=5
@@ -194,13 +196,9 @@ sudo systemctl daemon-reload
 > `WorkingDirectory=/opt/barriofix` + el tarball que extrae `app/` ahí
 > ⇒ `/opt/barriofix/app/main.py` ⇒ `app.main:app` resuelve. No cambiar uno sin el otro.
 >
-> Estas son las **únicas tres variables** que el backend lee. Los valores y el detalle de
-> cómo obtener cada uno están documentados en [`.env.example`](../.env.example) en la raíz
-> del repo — si cambiás uno ahí, cambialo también acá: en EC2 no se lee ningún `.env`,
-> estos `Environment=` son la fuente de verdad.
->
-> `CORS_ORIGINS` es opcional: si lo omitís, el default del código es `*` (cualquier origen),
-> que funciona igual para el lab.
+> El archivo `backend.env` no existe todavia en el disco: lo baja el User Data en
+> cada arranque (Fase 6). systemd tolera que falte al hacer daemon-reload; solo se
+> queja cuando el servicio arranca, y para entonces ya esta.
 
 
 ### 3.3b Enviar los logs a S3
@@ -374,7 +372,7 @@ Ya no sirve y consume presupuesto del lab. *Instance state → Terminate*.
 
 ---
 
-## Fase 4 — Subir el código a S3
+## Fase 4 — Subir el código y las variables a S3
 
 Desde la máquina local (PowerShell en Windows ya trae `tar`), parado en la raíz del repo:
 
@@ -390,6 +388,42 @@ tar -tzf app.tar.gz
 ```
 
 Subirlo: Consola → **S3** → `barriofix-artifacts-clara` → *Upload* → `app.tar.gz`
+
+### 4b. Un único `backend.env` con TODAS las variables
+
+Este archivo es el unico lugar donde viven los valores que la app necesita en runtime.
+Ni la AMI ni el User Data los conocen: los dos son genericos y reusables.
+
+Copiar `.env.example` del repo, completar las cinco variables y guardarlo como
+`backend.env` **sin comentarios ni lineas en blanco al principio** (systemd es tolerante
+pero mejor limpio):
+
+```bash
+AWS_REGION=us-east-1
+MEDIA_BUCKET=barriofix-media-clara
+CORS_ORIGINS=http://barriofix-frontend-clara.s3-website-us-east-1.amazonaws.com
+DATABASE_URL=postgresql://barriofix_admin:LA_PASSWORD_REAL@barriofix-db.xxxxxxxxxxxx.us-east-1.rds.amazonaws.com:5432/barriofix?sslmode=require
+JWT_SECRET=<generar con: python -c "import secrets; print(secrets.token_urlsafe(48))">
+```
+
+Subirlo al MISMO bucket que el tarball:
+
+```bash
+aws s3 cp backend.env s3://barriofix-artifacts-clara/backend.env
+```
+
+> ⚠️ **NUNCA commitear este archivo.** Tiene la password de RDS y el JWT_SECRET. El
+> `.gitignore` del repo ya lo cubre (`.env` esta ignorado), pero si le pusiste otro
+> nombre, verifica antes de un `git add`.
+>
+> ⚠️ **Un solo `JWT_SECRET` para las dos instancias del ASG.** Como todas leen el mismo
+> archivo de S3, esto se cumple solo. Si en algun momento manejas mas de un ambiente
+> (dev/prod) usa DOS archivos distintos en el bucket (`backend.dev.env`, `backend.prod.env`)
+> y el User Data elige uno.
+
+**Rotar una variable** (cambiar la password de RDS, cambiar el JWT_SECRET, agregar un
+origen a CORS): editar `backend.env`, subirlo pisando la version anterior, y reiniciar
+las instancias del ASG **de a una**. No hay que rehacer la AMI ni el tarball.
 
 ---
 
@@ -432,17 +466,26 @@ ARTIFACTS_BUCKET="barriofix-artifacts-clara"
 REGION="us-east-1"
 APP_DIR="/opt/barriofix"
 
-# Baja por el Gateway VPC Endpoint de S3, sin salir a internet.
-aws s3 cp "s3://${ARTIFACTS_BUCKET}/app.tar.gz" /tmp/app.tar.gz --region "${REGION}"
+# Los dos archivos vienen del mismo bucket, por el Gateway VPC Endpoint de
+# S3, sin salir a internet.
+aws s3 cp "s3://${ARTIFACTS_BUCKET}/app.tar.gz"   /tmp/app.tar.gz  --region "${REGION}"
+aws s3 cp "s3://${ARTIFACTS_BUCKET}/backend.env" "${APP_DIR}/backend.env" --region "${REGION}"
+
+# 600 + owner barriofix: la password de RDS y el JWT_SECRET viven ahi.
+chmod 600 "${APP_DIR}/backend.env"
+chown barriofix:barriofix "${APP_DIR}/backend.env"
 
 rm -rf "${APP_DIR}/app"
 tar -xzf /tmp/app.tar.gz -C "${APP_DIR}"
-chown -R barriofix:barriofix "${APP_DIR}"
+chown -R barriofix:barriofix "${APP_DIR}/app"
 
 systemctl enable --now barriofix-backend
 ```
 
-> Cambiar `ARTIFACTS_BUCKET` y `REGION` si tus nombres son otros.
+> Cambiar `ARTIFACTS_BUCKET` y `REGION` si tus nombres son otros. Si el `s3 cp` de
+> `backend.env` falla (bucket sin permiso, archivo inexistente), la instancia arranca
+> pero uvicorn se estrella al intentar leer las variables. Aparece como target unhealthy
+> en el ALB.
 
 ---
 

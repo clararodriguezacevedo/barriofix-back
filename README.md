@@ -65,20 +65,22 @@ psql "$DATABASE_URL" -c "UPDATE cuenta SET es_admin = TRUE WHERE username = 'tu_
 las dependencias: hay que rehacer la imagen antes del primer deploy. Ver `docs/DEPLOY-AWS.md`
 Fase 3.
 
-**3. Variables de entorno en las instancias.** Van en el `Environment=` del systemd unit,
-horneado en la AMI. Las tres que la app lee:
-
-- `DATABASE_URL` (con contraseña, la misma que arriba)
-- `JWT_SECRET` (la misma en las dos instancias del ASG, si no los tokens rebotan)
-- `CORS_ORIGINS` (website endpoint del bucket de frontend)
-
-Generar un JWT_SECRET nuevo:
+**3. Variables de entorno en un único archivo.** Todas viven en `backend.env`, que va
+al mismo bucket que el código. El systemd unit lo lee via `EnvironmentFile=` y el User
+Data lo baja de S3 en cada arranque, así que ni la AMI ni el User Data conocen valores
+sensibles. Copiar `.env.example`, completar y subir:
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
+cp .env.example backend.env
+# editar backend.env: poner la password real de RDS y generar el JWT_SECRET con:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+aws s3 cp backend.env s3://barriofix-artifacts-clara/backend.env
 ```
 
-**4. Deploy del código.** Empaquetar y subir al bucket de artefactos:
+⚠️ **Nunca commitear `backend.env`** — tiene password de RDS y el JWT_SECRET. Ya está
+cubierto por `.gitignore`.
+
+**4. Deploy del código.** Empaquetar y subir al mismo bucket:
 
 ```bash
 tar --exclude=__pycache__ --exclude=venv -czf app.tar.gz app
@@ -88,6 +90,9 @@ aws s3 cp app.tar.gz s3://barriofix-artifacts-clara/app.tar.gz
 Después, reciclar las instancias del ASG **de a una**, esperando que cada reemplazo quede
 `healthy` en el Target Group antes de terminar la siguiente. Si las dos quedan afuera a
 la vez, el ALB devuelve `503`.
+
+**Rotar una variable** (cambiar la password de RDS, un origen de CORS, el JWT_SECRET):
+editar `backend.env`, resubirlo, reciclar las instancias. Sin rehacer la AMI ni el tarball.
 
 **5. Verificar.** Contra el ALB:
 
