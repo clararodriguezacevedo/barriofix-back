@@ -208,6 +208,7 @@ class SolicitudOut(ORMModel):
     descripcion: str
     direccion: str
     fecha_creacion: datetime
+    fecha_actualizacion: datetime
     cancelada_por_cliente: bool
     fecha_cancelacion_cliente: Optional[datetime] = None
 

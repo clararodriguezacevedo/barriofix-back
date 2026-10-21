@@ -71,6 +71,9 @@ def solicitud_out(db: Session, solicitud: Solicitud) -> dict:
         "descripcion": solicitud.descripcion,
         "direccion": solicitud.direccion,
         "fecha_creacion": solicitud.fecha_creacion,
+        # Ultima modificacion = cuando empezo el estado actual (la fila de
+        # seguimiento abierta). Sirve para ordenar la lista por actividad.
+        "fecha_actualizacion": actual.fecha_desde,
         "cancelada_por_cliente": solicitud.cancelada_por_cliente,
         "fecha_cancelacion_cliente": solicitud.fecha_cancelacion_cliente,
         "categoria": solicitud.categoria,
